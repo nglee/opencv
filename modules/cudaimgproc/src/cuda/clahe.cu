@@ -143,22 +143,22 @@ namespace clahe
 
         // build histogram
 
-        for (int i = tid; i < histSize; i += blockSize)
-            hist(histRow, i) = 0;
+        //for (int i = tid; i < histSize; i += blockSize)
+        //    hist(histRow, i) = 0;
 
-        __syncthreads();
+        //__syncthreads();
 
-        for (int i = threadIdx.y; i < tileSize.y; i += blockDim.y)
-        {
-            const ushort* srcPtr = src.ptr(ty * tileSize.y + i) + tx * tileSize.x;
-            for (int j = threadIdx.x; j < tileSize.x; j += blockDim.x)
-            {
-                const int data = srcPtr[j];
-                ::atomicAdd(&hist(histRow, data), 1);
-            }
-        }
+        //for (int i = threadIdx.y; i < tileSize.y; i += blockDim.y)
+        //{
+        //    const ushort* srcPtr = src.ptr(ty * tileSize.y + i) + tx * tileSize.x;
+        //    for (int j = threadIdx.x; j < tileSize.x; j += blockDim.x)
+        //    {
+        //        const int data = srcPtr[j];
+        //        ::atomicAdd(&hist(histRow, data), 1);
+        //    }
+        //}
 
-        __syncthreads();
+        //__syncthreads();
 
         if (clipLimit > 0)
         {
@@ -338,10 +338,67 @@ namespace clahe
             CV_CUDEV_SAFE_CALL( cudaDeviceSynchronize() );
     }
 
+    __global__ void buildHistKernel_16U(PtrStepSzus src, int2 tileSize, int tilesX, int tilesY, PtrStepSzi hist)
+    {
+        __shared__ unsigned int smem[10923]; // 65536 / 6
+
+        for (int ty = 0; ty < tilesY; ty++)
+            for (int tx = 0; tx < tilesX; tx++) {
+
+                const int histRow = ty * tilesX + tx;
+
+                // initialize histogram
+                for (int i = threadIdx.x; i < 10923; i += blockDim.x)
+                    smem[i] = 0;
+
+                __syncthreads();
+
+                // build histogram
+                for (int i = threadIdx.y; i < tileSize.y; i += blockDim.y)
+                {
+                    const ushort* srcPtr = src.ptr(ty * tileSize.y + i) + tx * tileSize.x;
+                    for (int j = threadIdx.x; j < tileSize.x; j += blockDim.x)
+                    {
+                        const int data = srcPtr[j];
+
+                        const int smemIdx = data / 6;
+                        const int offset = data % 6;
+                        const unsigned incPoint = 1 << (offset * 5);
+
+                        ::atomicAdd(&smem[smemIdx], incPoint);
+                    }
+                }
+
+                __syncthreads();
+
+                // copy smem to gmem
+                for (int i = threadIdx.x; i < 10922; i += blockDim.x)
+                {
+                    unsigned val = smem[i];
+                    hist(histRow, i * 6)     += val & 0x0000001FU;
+                    hist(histRow, i * 6 + 1) += (val & 0x000003E0U) >> 5;
+                    hist(histRow, i * 6 + 2) += (val & 0x00007C00U) >> 10;
+                    hist(histRow, i * 6 + 3) += (val & 0x000F8000U) >> 15;
+                    hist(histRow, i * 6 + 4) += (val & 0x01F00000U) >> 20;
+                    hist(histRow, i * 6 + 5) += (val & 0x3E000000U) >> 25;
+                }
+                    int i = 10922;
+                    unsigned val = smem[i];
+                    hist(histRow, i * 6)     += val & 0x0000001FU;
+                    hist(histRow, i * 6 + 1) += (val & 0x000003E0U) >> 5;
+                    hist(histRow, i * 6 + 2) += (val & 0x00007C00U) >> 10;
+                    hist(histRow, i * 6 + 3) += (val & 0x000F8000U) >> 15;
+            }
+    }
+
     void calcLut_16U(PtrStepSzus src, PtrStepus lut, int tilesX, int tilesY, int2 tileSize, int clipLimit, float lutScale, PtrStepSzi hist, cudaStream_t stream)
     {
         const dim3 block(32, 8);
         const dim3 grid(tilesX, tilesY);
+
+        CV_CUDEV_SAFE_CALL( cudaMemset2D(hist.data, hist.step, 0x00, hist.cols * sizeof(int), hist.rows) );
+
+        buildHistKernel_16U<<<1, 16, 0, stream>>>(src, tileSize, tilesX, tilesY, hist);
 
         calcLutKernel_16U<<<grid, block, 0, stream>>>(src, lut, tileSize, tilesX, clipLimit, lutScale, hist);
 
@@ -350,6 +407,21 @@ namespace clahe
         if (stream == 0)
             CV_CUDEV_SAFE_CALL( cudaDeviceSynchronize() );
     }
+
+    //void calcLut_16U(PtrStepSzus src, PtrStepus lut, int tilesX, int tilesY, int2 tileSize, int clipLimit, float lutScale, PtrStepSzi hist, cudaStream_t stream)
+    //{
+    //    const dim3 block(32, 8);
+    //    const dim3 grid(tilesX, tilesY);
+
+    //    CV_CUDEV_SAFE_CALL( cudaMemset2D(hist.data, hist.step, 0x00, hist.cols * sizeof(int), hist.rows) );
+
+    //    calcLutKernel_16U<<<grid, block, 0, stream>>>(src, lut, tileSize, tilesX, clipLimit, lutScale, hist);
+
+    //    CV_CUDEV_SAFE_CALL( cudaGetLastError() );
+
+    //    if (stream == 0)
+    //        CV_CUDEV_SAFE_CALL( cudaDeviceSynchronize() );
+    //}
 
     template <typename T>
     __global__ void transformKernel(const PtrStepSz<T> src, PtrStep<T> dst, const PtrStep<T> lut, const int2 tileSize, const int tilesX, const int tilesY)
