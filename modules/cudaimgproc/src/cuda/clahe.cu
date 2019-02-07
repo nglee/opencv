@@ -125,6 +125,10 @@ namespace clahe
         lut(ty * tilesX + tx, tid) = saturate_cast<uchar>(__float2int_rn(lutScale * lutVal));
     }
 
+#define FIRSTVERSION 0
+
+#if FIRSTVERSION //__CUDACC_VER_MAJOR__ > 5
+
     __global__ void calcLutKernel_16U(const PtrStepus src, PtrStepus lut,
                                       const int2 tileSize, const int tilesX,
                                       const int clipLimit, const float lutScale,
@@ -143,10 +147,10 @@ namespace clahe
 
         // build histogram
 
-        for (int i = tid; i < histSize; i += blockSize)
-            hist(histRow, i) = 0;
+        //for (int i = tid; i < histSize; i += blockSize)
+        //    hist(histRow, i) = 0;
 
-        __syncthreads();
+        //__syncthreads();
 
         for (int i = threadIdx.y; i < tileSize.y; i += blockDim.y)
         {
@@ -226,7 +230,6 @@ namespace clahe
             // Following code block is in effect equivalent to:
             //
             //      blockReduce<blockSize>(smem, partialSum_, tid, plus<int>());
-            //
             {
                 for (int j = 16; j >= 1; j /= 2)
                 {
@@ -255,6 +258,26 @@ namespace clahe
                         int val = __shfl_down(partialSum_, j);
                     #endif
                         partialSum_ += val;
+                    }
+
+                    if (tid % 32 == 0)
+                        smem[tid / 32] = clipped;
+
+                    __syncthreads();
+
+                    if (tid < 8)
+                    {
+                        clipped = smem[tid];
+
+                        for (int j = 4; j >= 1; j /= 2)
+                        {
+                        #if __CUDACC_VER_MAJOR__ >= 9
+                            int val = __shfl_down_sync(0x000000FFU, clipped, j);
+                        #else
+                            int val = __shfl_down(clipped, j);
+                        #endif
+                            clipped += val;
+                        }
                     }
                 }
             }
@@ -325,6 +348,261 @@ namespace clahe
         #undef blockSize
     }
 
+#else // CV_CUDEV_ARCH < 35
+
+    __global__ void calcLutKernel_16U(const PtrStepus src, PtrStepus lut,
+                                      const int2 tileSize, const int tilesX,
+                                      const int clipLimit, const float lutScale,
+                                      PtrStepSzi hist)
+    {
+        #define histSize 65536
+        #define blockSize 512
+
+        __shared__ int smem[blockSize];
+
+        const int tx = blockIdx.x;
+        const int ty = blockIdx.y;
+        const unsigned int tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+        const int histRow = ty * tilesX + tx;
+
+        // build histogram
+
+        //for (int i = tid; i < histSize; i += blockSize)
+        //    hist(histRow, i) = 0;
+
+        //__syncthreads();
+
+        for (int i = threadIdx.y; i < tileSize.y; i += blockDim.y)
+        {
+            const ushort* srcPtr = src.ptr(ty * tileSize.y + i) + tx * tileSize.x;
+            for (int j = threadIdx.x; j < tileSize.x; j += blockDim.x)
+            {
+                const int data = srcPtr[j];
+                ::atomicAdd(&hist(histRow, data), 1);
+            }
+        }
+
+        __syncthreads();
+
+        int group;
+        if (tid < 256)
+            group = 0;
+        else
+            group = 1;
+
+        if (clipLimit > 0)
+        {
+            // clip histogram bar &&
+            // find number of overall clipped samples
+
+            __shared__ int partialSum[blockSize];
+
+            for (int i = tid; i < histSize * 2; i += blockSize)
+            {
+                __shared__ unsigned int flag[8];
+
+                int clipped = 0;
+
+                if (group == 0)
+                {
+                    int histVal = hist(histRow, i - 256 * (i / blockSize));
+
+                    if (histVal > clipLimit)
+                        clipped = histVal - clipLimit;
+
+                    unsigned int flag_ = __ballot_sync(0xFFFFFFFFU, clipped > 0);
+
+                    if (tid % 32 == 0)
+                        flag[tid / 32] = flag_;
+                }
+
+                if (group == 0)
+                {
+                    for (int j = 16; j >= 1; j /= 2)
+                    {
+                    #if __CUDACC_VER_MAJOR__ >= 9
+                        int val = __shfl_down_sync(0xFFFFFFFFU, clipped, j);
+                    #else
+                        int val = __shfl_down(clipped, j);
+                    #endif
+                        clipped += val;
+                    }
+
+                    if (tid % 32 == 0)
+                        smem[tid / 32] = clipped;
+                }
+
+                __syncthreads();
+
+                if (group == 1)
+                {
+                    unsigned int flag_ = flag[(tid - 256) / 32];
+
+                    if ((1 << (tid % 32)) & flag_)
+                        hist(histRow, i - 256 - 256 * (i / blockSize)) = clipLimit;
+                }
+
+                // Following code block is in effect equivalent to:
+                //
+                //      blockReduce<blockSize>(smem, clipped, tid, plus<int>());
+                //
+                //if (group == 0)
+                //{
+                //    for (int j = 16; j >= 1; j /= 2)
+                //    {
+                //    #if __CUDACC_VER_MAJOR__ >= 9
+                //        int val = __shfl_down_sync(0xFFFFFFFFU, clipped, j);
+                //    #else
+                //        int val = __shfl_down(clipped, j);
+                //    #endif
+                //        clipped += val;
+                //    }
+
+                //    if (tid % 32 == 0)
+                //        smem[tid / 32] = clipped;
+                //}
+
+                //__syncthreads();
+
+                if (group == 0)
+                {
+                    if (tid < 8)
+                    {
+                        clipped = smem[tid];
+
+                        for (int j = 4; j >= 1; j /= 2)
+                        {
+                        #if __CUDACC_VER_MAJOR__ >= 9
+                            int val = __shfl_down_sync(0x000000FFU, clipped, j);
+                        #else
+                            int val = __shfl_down(clipped, j);
+                        #endif
+                            clipped += val;
+                        }
+                    }
+                }
+                // end of code block
+
+                if (tid == 0)
+                    partialSum[i / blockSize] = clipped;
+
+                __syncthreads();
+            }
+
+            if (group == 1)
+                return;
+
+            int partialSum_ = partialSum[tid];
+
+            // Following code block is in effect equivalent to:
+            //
+            //      blockReduce<blockSize>(smem, partialSum_, tid, plus<int>());
+            {
+                for (int j = 16; j >= 1; j /= 2)
+                {
+                #if __CUDACC_VER_MAJOR__ >= 9
+                    int val = __shfl_down_sync(0xFFFFFFFFU, partialSum_, j);
+                #else
+                    int val = __shfl_down(partialSum_, j);
+                #endif
+                    partialSum_ += val;
+                }
+
+                if (tid % 32 == 0)
+                    smem[tid / 32] = partialSum_;
+
+                __syncthreads();
+
+                if (tid < 8)
+                {
+                    partialSum_ = smem[tid];
+
+                    for (int j = 4; j >= 1; j /= 2)
+                    {
+                    #if __CUDACC_VER_MAJOR__ >= 9
+                        int val = __shfl_down_sync(0x000000FFU, partialSum_, j);
+                    #else
+                        int val = __shfl_down(partialSum_, j);
+                    #endif
+                        partialSum_ += val;
+                    }
+                }
+            }
+            // end of code block
+
+            // broadcast evaluated value &&
+            // redistribute clipped samples evenly
+
+            __shared__ int totalClipped;
+            __shared__ int redistBatch;
+            __shared__ int residual;
+            __shared__ int rStep;
+
+            if (tid == 0)
+            {
+                totalClipped = partialSum_;
+                redistBatch = totalClipped / histSize;
+                residual = totalClipped - redistBatch * histSize;
+
+                rStep = 1;
+                if (residual != 0)
+                    rStep = histSize / residual;
+            }
+
+            __syncthreads();
+
+            for (int i = tid; i < histSize; i += 256)
+            {
+                int histVal = hist(histRow, i);
+
+                int equalized = histVal + redistBatch;
+
+                if (residual && i % rStep == 0 && i / rStep < residual)
+                    ++equalized;
+
+                hist(histRow, i) = equalized;
+            }
+        }
+        else
+        {
+            if (group == 1)
+                return;
+        }
+
+        __shared__ int partialScan[256];
+
+        for (int i = tid; i < histSize; i += 256)
+        {
+            int equalized = hist(histRow, i);
+            equalized = blockScanInclusive<256>(equalized, smem, tid);
+
+            if (tid == 256 - 1)
+                partialScan[i / 256] = equalized;
+
+            hist(histRow, i) = equalized;
+        }
+
+        __syncthreads();
+
+        int partialScan_ = partialScan[tid];
+        partialScan[tid] = blockScanExclusive<256>(partialScan_, smem, tid);
+
+        __syncthreads();
+
+        for (int i = tid; i < histSize; i += 256)
+        {
+            const int lutVal = hist(histRow, i) + partialScan[i / 256];
+
+            lut(histRow, i) = saturate_cast<ushort>(__float2int_rn(lutScale * lutVal));
+        }
+
+        #undef histSize
+        #undef blockSize
+    }
+
+#endif // CV_CUDEV_ARCH < 35
+
     void calcLut_8U(PtrStepSzb src, PtrStepb lut, int tilesX, int tilesY, int2 tileSize, int clipLimit, float lutScale, cudaStream_t stream)
     {
         const dim3 block(32, 8);
@@ -340,8 +618,14 @@ namespace clahe
 
     void calcLut_16U(PtrStepSzus src, PtrStepus lut, int tilesX, int tilesY, int2 tileSize, int clipLimit, float lutScale, PtrStepSzi hist, cudaStream_t stream)
     {
+#if FIRSTVERSION
         const dim3 block(32, 8);
+#else
+        const dim3 block(32, 16);
+#endif
         const dim3 grid(tilesX, tilesY);
+
+        CV_CUDEV_SAFE_CALL( cudaMemset2D(hist.data, hist.step, 0x00, hist.cols * sizeof(int), hist.rows) );
 
         calcLutKernel_16U<<<grid, block, 0, stream>>>(src, lut, tileSize, tilesX, clipLimit, lutScale, hist);
 
