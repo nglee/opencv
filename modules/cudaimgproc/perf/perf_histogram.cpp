@@ -186,7 +186,7 @@ PERF_TEST_P(Sz, EqualizeHist,
 DEF_PARAM_TEST(Sz_ClipLimit, cv::Size, double, MatType);
 
 PERF_TEST_P(Sz_ClipLimit, CLAHE,
-            Combine(CUDA_TYPICAL_MAT_SIZES,
+            Combine(Values(perf::szSmall128, perf::szVGA, perf::sz720p, perf::sz1080p, perf::sz2160p, perf::sz4320p),
                     Values(0.0, 40.0),
                     Values(MatType(CV_8UC1), MatType(CV_16UC1))))
 {

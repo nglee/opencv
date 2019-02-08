@@ -341,54 +341,82 @@ namespace clahe
     __global__ void buildHistKernel_16U(PtrStepSzus src, int2 tileSize, int tilesX, int tilesY, PtrStepSzi hist)
     {
         __shared__ unsigned int smem[10923]; // 65536 / 6
+        __shared__ unsigned int updated[16];
 
-        for (int ty = 0; ty < tilesY; ty++)
-            for (int tx = 0; tx < tilesX; tx++) {
+        const int tx = blockIdx.x;
+        const int ty = blockIdx.y;
 
-                const int histRow = ty * tilesX + tx;
+        const int histRow = ty * tilesX + tx;
+        const int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
-                // initialize histogram
-                for (int i = threadIdx.x; i < 10923; i += blockDim.x)
-                    smem[i] = 0;
+        // initialize histogram
+        for (int i = tid; i < 10923; i += blockDim.x * blockDim.y)
+            smem[i] = 0;
 
-                __syncthreads();
+        __syncthreads();
 
-                // build histogram
-                for (int i = threadIdx.y; i < tileSize.y; i += blockDim.y)
-                {
-                    const ushort* srcPtr = src.ptr(ty * tileSize.y + i) + tx * tileSize.x;
-                    for (int j = threadIdx.x; j < tileSize.x; j += blockDim.x)
-                    {
-                        const int data = srcPtr[j];
+        for (int base = 0; base < tileSize.x * tileSize.y; base += 16)
+        {
+            // build histogram
+            if (tid < 16 && base + tid < tileSize.x * tileSize.y) {
 
-                        const int smemIdx = data / 6;
-                        const int offset = data % 6;
-                        const unsigned incPoint = 1 << (offset * 5);
+                const int tileOffsetX = (base + tid) % tileSize.x;
+                const int tileOffsetY = (base + tid) / tileSize.x;
 
-                        ::atomicAdd(&smem[smemIdx], incPoint);
-                    }
-                }
+                const ushort* srcPtr = src.ptr(ty * tileSize.y + tileOffsetY) + tx * tileSize.x;
 
-                __syncthreads();
+                const int data = srcPtr[tileOffsetX];
 
-                // copy smem to gmem
-                for (int i = threadIdx.x; i < 10922; i += blockDim.x)
-                {
-                    unsigned val = smem[i];
-                    hist(histRow, i * 6)     += val & 0x0000001FU;
-                    hist(histRow, i * 6 + 1) += (val & 0x000003E0U) >> 5;
-                    hist(histRow, i * 6 + 2) += (val & 0x00007C00U) >> 10;
-                    hist(histRow, i * 6 + 3) += (val & 0x000F8000U) >> 15;
-                    hist(histRow, i * 6 + 4) += (val & 0x01F00000U) >> 20;
-                    hist(histRow, i * 6 + 5) += (val & 0x3E000000U) >> 25;
-                }
-                    int i = 10922;
-                    unsigned val = smem[i];
-                    hist(histRow, i * 6)     += val & 0x0000001FU;
-                    hist(histRow, i * 6 + 1) += (val & 0x000003E0U) >> 5;
-                    hist(histRow, i * 6 + 2) += (val & 0x00007C00U) >> 10;
-                    hist(histRow, i * 6 + 3) += (val & 0x000F8000U) >> 15;
+                const int smemIdx = data / 6;
+                const int offset = data % 6;
+                const unsigned incPoint = 1 << (offset * 5);
+
+                ::atomicAdd(&smem[smemIdx], incPoint);
+
+                updated[tid] = data;
             }
+
+            __syncthreads();
+
+            if (tid == 0)
+            {
+                for (int i = 0; i < 16; i++)
+                {
+                    int smemIdx = updated[i] / 6;
+                    int offset = updated[i] % 6;
+
+                    hist(histRow, updated[i]) += (smem[smemIdx] & (0x1FU << (offset * 5))) >> (offset * 5);
+
+                    smem[smemIdx] &= ~(0x1FU << (offset * 5));
+                    updated[i] = 0;
+                }
+            }
+
+            // copy smem to gmem
+            //for (int j = tid; j < 10922; j += blockDim.x * blockDim.y)
+            //{
+            //    unsigned val = smem[j];
+            //    smem[j] = 0;
+            //    hist(histRow, j * 6)     += val & 0x0000001FU;
+            //    hist(histRow, j * 6 + 1) += (val & 0x000003E0U) >> 5;
+            //    hist(histRow, j * 6 + 2) += (val & 0x00007C00U) >> 10;
+            //    hist(histRow, j * 6 + 3) += (val & 0x000F8000U) >> 15;
+            //    hist(histRow, j * 6 + 4) += (val & 0x01F00000U) >> 20;
+            //    hist(histRow, j * 6 + 5) += (val & 0x3E000000U) >> 25;
+            //}
+            //if (tid == 0)
+            //{
+            //    int j = 10922;
+            //    unsigned val = smem[j];
+            //    smem[j] = 0;
+            //    hist(histRow, j * 6)     += val & 0x0000001FU;
+            //    hist(histRow, j * 6 + 1) += (val & 0x000003E0U) >> 5;
+            //    hist(histRow, j * 6 + 2) += (val & 0x00007C00U) >> 10;
+            //    hist(histRow, j * 6 + 3) += (val & 0x000F8000U) >> 15;
+            //}
+
+            __syncthreads();
+        }
     }
 
     void calcLut_16U(PtrStepSzus src, PtrStepus lut, int tilesX, int tilesY, int2 tileSize, int clipLimit, float lutScale, PtrStepSzi hist, cudaStream_t stream)
@@ -398,7 +426,7 @@ namespace clahe
 
         CV_CUDEV_SAFE_CALL( cudaMemset2D(hist.data, hist.step, 0x00, hist.cols * sizeof(int), hist.rows) );
 
-        buildHistKernel_16U<<<1, 16, 0, stream>>>(src, tileSize, tilesX, tilesY, hist);
+        buildHistKernel_16U<<<grid, 16, 0, stream>>>(src, tileSize, tilesX, tilesY, hist);
 
         calcLutKernel_16U<<<grid, block, 0, stream>>>(src, lut, tileSize, tilesX, clipLimit, lutScale, hist);
 

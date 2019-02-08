@@ -145,7 +145,7 @@ typedef tuple<Size, double, MatType> Sz_ClipLimit_t;
 typedef TestBaseWithParam<Sz_ClipLimit_t> Sz_ClipLimit;
 
 PERF_TEST_P(Sz_ClipLimit, CLAHE,
-            testing::Combine(testing::Values(::perf::szVGA, ::perf::sz720p, ::perf::sz1080p),
+            testing::Combine(testing::Values(::perf::szSmall128, ::perf::szVGA, ::perf::sz720p, ::perf::sz1080p, ::perf::sz2160p, ::perf::sz4320p),
                              testing::Values(0.0, 40.0),
                              testing::Values(MatType(CV_8UC1), MatType(CV_16UC1)))
             )

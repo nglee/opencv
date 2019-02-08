@@ -256,7 +256,7 @@ PARAM_TEST_CASE(CLAHE, cv::cuda::DeviceInfo, cv::Size, ClipLimit, MatType)
 
 CUDA_TEST_P(CLAHE, Accuracy)
 {
-    cv::Mat src;
+    cv::Mat src;// = cv::Mat(size, type, cv::Scalar(0));
     if (type == CV_8UC1)
         src = randomMat(size, type);
     else if (type == CV_16UC1)
@@ -275,7 +275,7 @@ CUDA_TEST_P(CLAHE, Accuracy)
 
 INSTANTIATE_TEST_CASE_P(CUDA_ImgProc, CLAHE, testing::Combine(
     ALL_DEVICES,
-    DIFFERENT_SIZES,
+    testing::Values(cv::Size(113, 113), cv::Size(128, 128), cv::Size(1280, 720), cv::Size(1920, 1080), cv::Size(3840, 2160), cv::Size(4096, 4096)),
     testing::Values(0.0, 5.0, 10.0, 20.0, 40.0),
     testing::Values(MatType(CV_8UC1), MatType(CV_16UC1))));
 
